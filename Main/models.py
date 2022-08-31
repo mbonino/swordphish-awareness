@@ -2,7 +2,7 @@ import datetime
 from django.utils.timezone import get_current_timezone
 import uuid
 from base64 import b64decode
-from smtplib import SMTPRecipientsRefused
+from smtplib import SMTPRecipientsRefused, SMTPServerDisconnected
 from email.mime.image import MIMEImage
 from email.header import Header
 from bs4 import BeautifulSoup
@@ -17,16 +17,17 @@ from django.forms import ValidationError
 from django.core import mail
 from django.conf import settings
 from django.urls import reverse
-from django.utils.encoding import python_2_unicode_compatible
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 from django.core.validators import RegexValidator
 
 from LocalUsers.models import SwordphishUser, get_admin
 from Main.utils import send_alert_new_campaign
 
-
+import re
+import logging
+from time import sleep
 # Create your models here.
-@python_2_unicode_compatible
+
 class Attribute(models.Model):
     key = models.CharField(db_index=True, max_length=240)
     value = models.CharField(db_index=True, max_length=240)
@@ -61,7 +62,7 @@ class Target(models.Model):
         self.save()
 
 
-@python_2_unicode_compatible
+
 class TargetList(models.Model):
     class Meta:
         ordering = ["name", "-creation_date"]
@@ -79,7 +80,12 @@ class TargetList(models.Model):
         ws = wb.active
         targets = {}
         header = next(ws.rows)
-        tags_keys = [x.value for x in header[1:] if x.value is not None]
+        tags_keys = []
+        n = 1
+        for x in header[1:]:
+            if x.value is not None:
+                tags_keys.append('ORDN-' +  "%03d" % n + '-' + x.value)
+                n += 1
         for row in ws.iter_rows(row_offset=1):
             if row[0] and row[0].value:
                 email = row[0].value.lower()
@@ -135,13 +141,17 @@ class TargetList(models.Model):
             for attribute in attributes:
                 mails[target.mail_address][attribute.key] = attribute.value
                 tags.add(attribute.key)
-        header = list(tags)
+        raw_header = list(sorted(tags))
+        header = []
+        for h in raw_header:
+            h = re.sub(r'ORDN-[0-9]{3}-','',h)
+            header.append(h)
         header.insert(0, "email")
         ws.append(header)
         for address in mails:
             line = []
             line.append(address)
-            for tag in tags:
+            for tag in sorted(tags):
                 if tag in mails[address]:
                     line.append(mails[address][tag])
                 else:
@@ -161,7 +171,7 @@ class TargetList(models.Model):
         return save_virtual_workbook(wb)
 
 
-@python_2_unicode_compatible
+
 class AnonymousTarget(models.Model):
     uniqueid = models.CharField(db_index=True, max_length=36, default=uuid.uuid4)
     attributes = models.ManyToManyField(Attribute)
@@ -190,7 +200,7 @@ class AnonymousTarget(models.Model):
             self.attributes.add(att)
 
 
-@python_2_unicode_compatible
+
 class PhishmailDomain(models.Model):
     class Meta:
         ordering = ["domain"]
@@ -201,7 +211,7 @@ class PhishmailDomain(models.Model):
         return self.domain
 
 
-@python_2_unicode_compatible
+
 class Template(models.Model):
 
     class Meta:
@@ -220,7 +230,7 @@ class Template(models.Model):
         ('7', _('Fake ransomware template')),
     ]
 
-    template_type = models.CharField(max_length=1, choices=TEMPLATE_TYPE, default=1)
+    template_type = models.CharField(max_length=2, choices=TEMPLATE_TYPE, default=1)
     name = models.CharField(max_length=200)
     author = models.ForeignKey(SwordphishUser, on_delete=models.SET(get_admin))
     creation_date = models.DateTimeField(auto_now_add=True, blank=True)
@@ -247,7 +257,7 @@ class Template(models.Model):
         return False
 
 
-@python_2_unicode_compatible
+
 class Campaign(models.Model):
 
     class Meta:
@@ -495,6 +505,7 @@ class Campaign(models.Model):
 
         if target:
             for att in target.attributes.all():
+                att.key = re.sub(r'ORDN-[0-9]{3}-','',att.key)
                 html_content = html_content.replace("($%s$)" % (att.key), att.value)
 
         email.attach_alternative(html_content, "text/html")
@@ -548,6 +559,7 @@ class Campaign(models.Model):
 
         if target:
             for att in target.attributes.all():
+                att.key = re.sub(r'ORDN-[0-9]{3}-','',att.key)
                 html_content = html_content.replace("($%s$)" % (att.key), att.value)
         email.attach_alternative(html_content, "text/html")
         temp = "%s.doc" % (self.attachment_template.title)
@@ -562,6 +574,7 @@ class Campaign(models.Model):
         email.send(fail_silently=False)
 
     def start(self):
+        logger = logging.getLogger(__name__)
         if self.status != "2":
             self.status = "2"
         attachment_content = self.__buildattachment()
@@ -576,17 +589,15 @@ class Campaign(models.Model):
         except SMTPRecipientsRefused:
             pass
         targetlists = self.targets.all()
-        connec = mail.get_connection()
+        connec = mail.get_connection(fail_silently=False,timeout=15)
         connec.open()
         mail_content = self.__buildemail()
         for targetlist in targetlists:
             targets = targetlist.targets.all()
             for target in targets:
                 newAnon = AnonymousTarget()
-                newAnon.mail_sent_time = datetime.datetime.now(tz=get_current_timezone())
                 newAnon.save()
                 newAnon.importAttributes(target)
-                self.anonymous_targets.add(newAnon)
                 try:
                     if self.campaign_type in ["1", "3", "4"]:
                         self.__sendemail(target.mail_address,
@@ -603,6 +614,38 @@ class Campaign(models.Model):
                                                        )
                 except SMTPRecipientsRefused:
                     pass
+                except SMTPServerDisconnected:
+                    logger.error("Timeout connecting to SMTP server")
+                    logger.info("Pause for a little while before opening a new connection")
+                    sleep(60)
+                    try:
+                        connec = mail.get_connection(fail_silently=False,timeout=15)
+                        connec.open()
+                        if self.campaign_type in ["1", "3", "4"]:
+                            self.__sendemail(target.mail_address,
+                                             newAnon.uniqueid,
+                                             connec,
+                                             mail_content
+                                             )
+                        elif self.campaign_type == "2":
+                            self.__sendemailwithattachment(target.mail_address,
+                                                           newAnon.uniqueid,
+                                                           connec,
+                                                           mail_content,
+                                                           attachment_content
+                                                           )
+                    except SMTPServerDisconnected:
+                        logger.error("Failed to reopen a connection to SMTP server. Giving up")
+                        break
+                    else:
+                        logger.info("New connection is working")
+                        newAnon.mail_sent_time = datetime.datetime.now(tz=get_current_timezone())
+                        self.anonymous_targets.add(newAnon)
+                        newAnon.save()
+                else:
+                    newAnon.mail_sent_time = datetime.datetime.now(tz=get_current_timezone())
+                    self.anonymous_targets.add(newAnon)
+                    newAnon.save()
         connec.close()
         return True
 
@@ -628,11 +671,12 @@ class Campaign(models.Model):
         connec.close()
         return True
 
-    def download_results_xlsx(self):
+    def generate_results_xlsx(self):
         targets = self.anonymous_targets.all()
         wb = Workbook()
         ws = wb.active
         tags = set()
+        dest_filename = 'results/' + str(self.id) + '.xlsx'
 
         for target in targets:
             attributes = target.attributes.all()
@@ -659,8 +703,8 @@ class Campaign(models.Model):
         header.append("reported")
         header.append("reported time")
 
-        for tag in tags:
-            header.append(tag)
+        for tag in sorted(tags):
+            header.append(re.sub(r'ORDN-[0-9]{3}-','',tag))
 
         ft = Font(bold=True)
         al = Alignment(horizontal="center", vertical="center")
@@ -731,7 +775,7 @@ class Campaign(models.Model):
             else:
                 reported_time = "N/A"
 
-            for tag in tags:
+            for tag in sorted(tags):
                 att = target.attributes.filter(key=tag)
                 if att:
                     values.append(att[0].value)
@@ -787,7 +831,8 @@ class Campaign(models.Model):
 
         c = ws['B2']
         ws.freeze_panes = c
-        return save_virtual_workbook(wb)
+        wb.save(filename = dest_filename)
+        return True
 
     def count_targets(self):
         lists = self.targets.all()
